@@ -138,10 +138,12 @@ python generate_a_share_daily.py --mode auto --json --strict --output-dir ga_out
 - 工作日定时执行：
   - `35 4 * * 1-5`：北京时间 12:35 左右，适合午盘
   - `15 8 * * 1-5`：北京时间 16:15 左右，适合收盘
+- **幂等去重**：同一时段（午盘/收盘）只发送一次通知，防止重复
+- **退出码分级**：捕获生成脚本退出码，飞书差异化通知（成功/不完整/失败）
+- **GitHub Pages 部署**：报告自动部署为静态页面，可直接通过链接访问
+- **自定义板块**：通过 GitHub Variables 配置 `FOCUS_GROUPS_JSON` 自定义跟踪板块
 - 自动安装 `requirements.txt` 中依赖
 - 统一通过 `generate_a_share_daily.py` 生成报告
-- 将 `ga_out/` 与运行摘要作为 artifact 上传
-- 预留飞书机器人通知步骤
 
 ### 手动触发参数
 
@@ -158,28 +160,81 @@ python generate_a_share_daily.py --mode auto --json --strict --output-dir ga_out
 
 未配置该 Secret 时，workflow 不会失败，通知脚本会自动输出 `missing webhook` 并跳过发送。
 
+### GitHub Variables 配置 — 自定义跟踪板块
+
+默认跟踪 8 个重点板块：科技硬件/AI算力、通信设备/光模块、互联网软件/信创、有色金属/黄金、资源能源/高股息、电力/电网、化工材料、银行/国债。
+
+如需自定义，可在仓库 `Settings -> Secrets and variables -> Actions -> Variables` 中添加：
+
+- **Name**：`FOCUS_GROUPS_JSON`
+- **Value**：JSON 格式的板块配置，例如：
+
+```json
+{
+  "科技硬件 / AI算力": {
+    "中际旭创": "sz300308",
+    "新易盛": "sz300502",
+    "天孚通信": "sz300394"
+  },
+  "有色金属 / 黄金": {
+    "山东黄金": "sh600547",
+    "紫金矿业": "sh601899",
+    "中金黄金": "sh600489"
+  },
+  "自定义板块名": {
+    "股票简称": "交易所代码+股票代码"
+  }
+}
+```
+
+**代码格式说明**：
+- 顶层 key 为板块名称（如 `"科技硬件 / AI算力"`）
+- 内层 key 为股票简称，value 为 `sh`（上海）或 `sz`（深圳）+ 6位股票代码
+- 未设置该 Variable 时自动使用内置默认的 8 个板块
+- JSON 格式错误时会静默 fallback 到默认值
+
 ### 飞书通知脚本
 
-新增脚本：`notify_feishu.py`
+脚本：`notify_feishu.py`
 
 用途：
 - 读取 `ga_out/result.json`
 - 自动拼装任务状态、报告日期、完整度、校验摘要
-- 将 GitHub Actions 运行链接一并发送到飞书
+- 根据退出码发送差异化通知（简洁链接模式）
+
+**退出码通知策略**：
+
+| 退出码 | 含义 | 飞书通知 |
+|--------|------|----------|
+| `0` | 完美，数据完整 | `📊 A股收盘报告 YYYY-MM-DD 已出` + 报告链接 |
+| `2` | 报告已生成，但数据可能不完整 | `⚠️ A股收盘报告 YYYY-MM-DD 已出 (数据可能不完整)` + 报告链接 |
+| `1` | 生成失败 | `❌ A股收盘报告 YYYY-MM-DD 生成失败` + 错误信息 |
+
+**主要参数**：
+- `--webhook`：飞书 Webhook 地址
+- `--status-file`：状态 JSON 文件路径
+- `--exit-code`：脚本退出码（0/1/2），决定通知内容
+- `--simple`：简洁模式，仅发送报告链接通知
+- `--report-url`：GitHub Pages 报告链接
+- `--workflow-url`：GitHub Actions 运行链接
+- `--dry-run`：本地预览，不实际发送
 
 本地 dry-run 示例：
 
 ```bash
-python notify_feishu.py --status-file ga_out/result.json --dry-run
+python notify_feishu.py --status-file ga_out/result.json --exit-code 0 --simple --report-url "https://lambda-zhou.github.io/stock_report/" --dry-run
 ```
 
-实际发送示例：
+实际发送示例（workflow 中自动调用）：
 
 ```bash
 python notify_feishu.py \
   --webhook "$FEISHU_WEBHOOK_URL" \
   --status-file ga_out/result.json \
-  --workflow-url "https://github.com/<owner>/<repo>/actions/runs/<run_id>"
+  --exit-code "$EXIT_CODE" \
+  --simple \
+  --report-url "https://lambda-zhou.github.io/stock_report/" \
+  --workflow-url "https://github.com/Lambda-zhou/stock_report/actions/runs/$GITHUB_RUN_ID"
 ```
 
 ### 推荐仓库文件
@@ -194,6 +249,16 @@ requirements.txt
 notify_feishu.py
 .github/workflows/daily-report.yml
 ```
+
+### GitHub Pages 配置
+
+报告会自动部署到 GitHub Pages。首次使用需要：
+
+1. 仓库 → Settings → Pages
+2. Source 选择 **`GitHub Actions`**
+3. 保存后，报告地址为：`https://lambda-zhou.github.io/stock_report/`
+
+Workflow 中的 `deploy-pages` job 会在每次成功生成报告后自动部署，无需手动操作。
 
 ### 上线建议
 
