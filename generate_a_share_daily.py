@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sys
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,62 @@ def resolve_mode(mode: str, now: datetime) -> str:
     if mode != "auto":
         return mode
     return "midday" if now.hour < 15 else "close"
+
+
+def check_dedup(output_dir: str | Path, mode: str, date: str) -> bool:
+    """检查今日该模式是否已成功发送过，返回 True 表示应跳过。"""
+    marker = Path(output_dir) / f".sent_{mode}_{date}"
+    if marker.exists():
+        print(f"去重跳过：{marker.name} 已存在，今日 {mode} 已成功发送。")
+        return True
+    return False
+
+
+def write_dedup_marker(output_dir: str | Path, mode: str, date: str) -> None:
+    """写入去重标记文件。"""
+    marker = Path(output_dir) / f".sent_{mode}_{date}"
+    marker.write_text(datetime.now().isoformat(), encoding="utf-8")
+
+
+def send_feishu(webhook_url: str, title: str, report_url: str | None = None,
+                exit_code: int = 0, error_msg: str | None = None) -> bool:
+    """发送飞书通知。exit_code: 0=成功, 2=不完整, 1=失败。"""
+    if not webhook_url:
+        print("飞书通知跳过：未配置 webhook。")
+        return False
+
+    if exit_code == 1:
+        status_icon = "❌"
+        status_text = "报告生成失败"
+    elif exit_code == 2:
+        status_icon = "⚠️"
+        status_text = "报告已生成（数据可能不完整）"
+    else:
+        status_icon = "📊"
+        status_text = "报告已生成"
+
+    content = f"{status_icon} {title}\n{status_text}"
+    if report_url:
+        content += f"\n👉 {report_url}"
+    if error_msg:
+        content += f"\n错误：{error_msg}"
+
+    payload = json.dumps({"msg_type": "text", "content": {"text": content}}).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            webhook_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 200:
+                print(f"飞书通知已发送：{status_text}")
+                return True
+            print(f"飞书通知失败：HTTP {resp.status}")
+            return False
+    except Exception as e:
+        print(f"飞书通知异常：{e}")
+        return False
 
 
 def normalize_date(report_date: str | None, now: datetime) -> str:
@@ -134,6 +192,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="启用严格校验：HTML 文件存在、日期命中，且数据完整度达到模式阈值（午盘>=90，收盘>=95）。",
     )
+    parser.add_argument("--feishu-webhook", default=os.environ.get("FEISHU_WEBHOOK_URL"),
+                        help="飞书 Webhook 地址，默认从环境变量 FEISHU_WEBHOOK_URL 读取。")
+    parser.add_argument("--report-url", default=os.environ.get("REPORT_URL"),
+                        help="报告在线地址，用于飞书通知中附带链接。")
+    parser.add_argument("--no-dedup", action="store_true",
+                        help="禁用幂等去重，强制重新生成并发送通知。")
     return parser
 
 
@@ -161,11 +225,29 @@ def persist_result_file(result: dict[str, Any], output_dir: str | Path) -> Path:
 
 def main() -> int:
     args = build_parser().parse_args()
+    now = datetime.now()
+    selected_mode = resolve_mode(args.mode, now)
+    date_value = args.date or now.strftime("%Y-%m-%d")
+
+    # 幂等去重：今日该模式已发送则跳过
+    if not args.no_dedup and check_dedup(args.output_dir, selected_mode, date_value):
+        return 0
+
     try:
         result = generate(args.mode, args.date, args.output_dir, strict=args.strict)
         persist_result_file(result, args.output_dir)
         emit_result(result, args.json)
-        return 0 if result["validation"]["ok"] else 2
+        exit_code = 0 if result["validation"]["ok"] else 2
+
+        # 写入去重标记 + 发送飞书通知
+        write_dedup_marker(args.output_dir, result["mode"], result["report_date"])
+        send_feishu(
+            args.feishu_webhook or "",
+            f"{result['success_message']} {result['report_date']}",
+            report_url=args.report_url,
+            exit_code=exit_code,
+        )
+        return exit_code
     except Exception as exc:
         error_result = {
             "status": "error",
@@ -183,6 +265,12 @@ def main() -> int:
             print("日报生成失败：")
             print(f"错误类型：{error_result['error_type']}")
             print(f"错误信息：{error_result['error']}")
+        send_feishu(
+            args.feishu_webhook or "",
+            f"报告生成失败 {date_value}",
+            exit_code=1,
+            error_msg=str(exc),
+        )
         return 1
 
 
