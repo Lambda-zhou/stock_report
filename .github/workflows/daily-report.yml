@@ -1,0 +1,238 @@
+name: ai-stock-daily-report
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Report mode
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - midday
+          - close
+      report_date:
+        description: Optional report date in YYYY-MM-DD
+        required: false
+        type: string
+      strict:
+        description: Enable strict validation
+        required: false
+        default: true
+        type: boolean
+      upload_artifact:
+        description: Upload ga_out artifact
+        required: false
+        default: true
+        type: boolean
+  schedule:
+    # 午盘窗口：北京 12:20/12:30/12:40 → UTC 4:20/4:30/4:40
+    - cron: '20 4 * * 1-5'
+    - cron: '30 4 * * 1-5'
+    - cron: '40 4 * * 1-5'
+    # 收盘窗口：北京 16:50/17:00/17:10 → UTC 8:50/9:00/9:10
+    - cron: '50 8 * * 1-5'
+    - cron: '0 9 * * 1-5'
+    - cron: '10 9 * * 1-5'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: stock-report-${{ github.event.schedule || 'manual' }}
+  cancel-in-progress: true
+
+jobs:
+  build-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Resolve runtime parameters
+        id: params
+        shell: bash
+        run: |
+          MODE="auto"
+          REPORT_DATE=""
+          STRICT="true"
+          UPLOAD_ARTIFACT="true"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            [[ -n "${{ github.event.inputs.mode }}" ]] && MODE="${{ github.event.inputs.mode }}"
+            REPORT_DATE="${{ github.event.inputs.report_date }}"
+            [[ -n "${{ github.event.inputs.strict }}" ]] && STRICT="${{ github.event.inputs.strict }}"
+            [[ -n "${{ github.event.inputs.upload_artifact }}" ]] && UPLOAD_ARTIFACT="${{ github.event.inputs.upload_artifact }}"
+          fi
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "report_date=$REPORT_DATE" >> "$GITHUB_OUTPUT"
+          echo "strict=$STRICT" >> "$GITHUB_OUTPUT"
+          echo "upload_artifact=$UPLOAD_ARTIFACT" >> "$GITHUB_OUTPUT"
+
+      - name: Dedup check (skip if already sent today)
+        id: dedup
+        shell: bash
+        run: |
+          TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)
+          MODE="${{ steps.params.outputs.mode }}"
+          # auto模式下根据当前时间判断应该用哪个mode
+          if [[ "$MODE" == "auto" ]]; then
+            HOUR=$(TZ=Asia/Shanghai date +%H)
+            if [[ "$HOUR" -lt 14 ]]; then
+              MODE="midday"
+            else
+              MODE="close"
+            fi
+            echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          fi
+          DEDUP_KEY="sent-${TODAY}-${MODE}"
+          echo "dedup_key=$DEDUP_KEY" >> "$GITHUB_OUTPUT"
+          echo "today=$TODAY" >> "$GITHUB_OUTPUT"
+          echo "resolved_mode=$MODE" >> "$GITHUB_OUTPUT"
+          # 检查 cache 是否存在（首次 save 会在步骤末尾）
+          if [[ -f "/tmp/$DEDUP_KEY" ]]; then
+            echo "⏭ $DEDUP_KEY marker found, skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "🚀 $DEDUP_KEY not found, will run."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dedup marker
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/dedup-marker
+          key: sent-${{ steps.dedup.outputs.today }}-${{ steps.dedup.outputs.resolved_mode }}
+          fail-on-cache-miss: false
+
+      - name: Re-check dedup after cache restore
+        id: dedup-final
+        shell: bash
+        run: |
+          DEDUP_KEY="${{ steps.dedup.outputs.dedup_key }}"
+          if [[ -f "/tmp/dedup-marker/$DEDUP_KEY" ]]; then
+            echo "⏭ Already sent ${{ steps.dedup.outputs.resolved_mode }} report today, skipping all."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate HTML report
+        if: steps.dedup-final.outputs.skip != 'true'
+        id: generate
+        shell: bash
+        env:
+          FOCUS_GROUPS_JSON: ${{ vars.FOCUS_GROUPS_JSON }}
+        run: |
+          set +e
+          mkdir -p ga_out
+          CMD=(python generate_a_share_daily.py --mode "${{ steps.dedup.outputs.resolved_mode }}" --output-dir ga_out --json)
+          if [[ -n "${{ steps.params.outputs.report_date }}" ]]; then
+            CMD+=(--date "${{ steps.params.outputs.report_date }}")
+          fi
+          if [[ "${{ steps.params.outputs.strict }}" == "true" ]]; then
+            CMD+=(--strict)
+          fi
+          printf 'Running command: %q ' "${CMD[@]}"
+          echo
+          "${CMD[@]}" | tee ga_out/result.json
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          if [[ $EXIT_CODE -eq 0 ]]; then
+            REPORT_PATH=$(python -c "import json; print(json.load(open('ga_out/result.json'))['output_path'])")
+            echo "path=$REPORT_PATH" >> "$GITHUB_OUTPUT"
+          fi
+          exit $EXIT_CODE
+      - name: Copy report as latest.html for stable URL
+        if: always() && steps.dedup-final.outputs.skip != 'true'
+        shell: bash
+        run: |
+          REPORT="${{ steps.generate.outputs.path }}"
+          if [[ -f "$REPORT" ]]; then
+            cp "$REPORT" ga_out/latest.html
+          fi
+
+
+      - name: Upload generated artifacts
+        if: always() && steps.dedup-final.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-stock-report-${{ github.run_number }}
+          path: |
+            ga_out/**
+            summary.md
+          if-no-files-found: warn
+
+      - name: Persist dedup marker
+        if: always() && steps.dedup.outputs.dedup_key != '' && steps.dedup-final.outputs.skip != 'true'
+        shell: bash
+        run: |
+          mkdir -p dedup-marker
+          echo "${{ steps.dedup.outputs.dedup_key }}" > "dedup-marker/${{ steps.dedup.outputs.dedup_key }}"
+          gh actions-cache save dedup-marker --key dedup-marker-${{ steps.dedup.outputs.dedup_key }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Send Feishu notification
+        if: always() && steps.dedup-final.outputs.skip != 'true'
+        continue-on-error: true
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/latest.html
+          EXIT_CODE: ${{ steps.generate.outputs.exit_code }}
+        run: |
+          python notify_feishu.py \
+            --webhook "$FEISHU_WEBHOOK_URL" \
+            --status-file ga_out/result.json \
+            --report-url "$PAGES_URL" \
+            --exit-code "$EXIT_CODE" \
+            --simple
+
+  deploy-pages:
+    needs: build-report
+    if: always() && needs.build-report.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-stock-report-${{ github.run_number }}
+          path: pages-content
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages-content
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
