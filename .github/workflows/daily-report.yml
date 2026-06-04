@@ -10,6 +10,8 @@ jobs:
   stock-report:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -26,3 +28,32 @@ jobs:
           REPORT_URL: 'https://lambda-zhou.github.io/stock_report/'
           FOCUS_GROUPS_JSON: ${{ vars.FOCUS_GROUPS_JSON }}
         run: python generate_a_share_daily.py --mode auto --output-dir ga_out --json
+
+      - name: Prepare Pages content
+        run: |
+          python - <<'PY'
+          import json
+          import shutil
+          from pathlib import Path
+
+          result = json.loads(Path('ga_out/result.json').read_text(encoding='utf-8'))
+          src = Path(result['output_path'])
+          dst_dir = Path('pages-content')
+          dst_dir.mkdir(parents=True, exist_ok=True)
+
+          if not src.exists():
+              raise SystemExit(f'HTML not found: {src}')
+
+          shutil.copy2(src, dst_dir / src.name)
+          shutil.copy2(src, dst_dir / 'index.html')
+          (dst_dir / '.nojekyll').write_text('', encoding='utf-8')
+          (dst_dir / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(f'Prepared Pages content from: {src}')
+          PY
+
+      - name: Deploy to gh-pages branch
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: gh-pages
+          folder: pages-content
+          clean: true
