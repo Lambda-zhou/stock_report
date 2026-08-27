@@ -1,17 +1,17 @@
 {
   "status": "success",
-  "mode": "midday",
+  "mode": "close",
   "mode_requested": "auto",
-  "report_date": "2026-08-26",
-  "output_path": "ga_out/A股午盘日报_2026-08-26.html",
-  "generated_at": "2026-08-26 09:34:44",
-  "data_completeness": 97,
+  "report_date": "2026-08-27",
+  "output_path": "ga_out/A股收盘日报_2026-08-27.html",
+  "generated_at": "2026-08-27 15:16:06",
+  "data_completeness": 99,
   "trading_day": true,
-  "success_message": "午盘日报生成成功",
-  "strict_threshold": 90,
+  "success_message": "日报生成成功",
+  "strict_threshold": 95,
   "data_quality": {
-    "score": 97,
-    "missing_count": 3,
+    "score": 99,
+    "missing_count": 1,
     "checks": {
       "date_present": true,
       "has_indices": true,
@@ -39,7 +39,7 @@
       "has_focus": true,
       "has_sources": true
     },
-    "missing_count": 3,
-    "strict_threshold": 90
+    "missing_count": 1,
+    "strict_threshold": 95
   }
 }
